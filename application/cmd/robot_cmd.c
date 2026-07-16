@@ -197,13 +197,15 @@ static void RemoteControlSet()
     else
         ; // 弹舱舵机控制,待添加servo_motor模块,关闭
 
+    // shoot_mode 由 RobotCMDTask 在每次循环开头默认置 SHOOT_ON(急停/离线由EmergencyHandler覆盖), 这里不再重复设置
+
     // 摩擦轮控制,拨轮向上打为负,向下为正
     if (rc_data[TEMP].rc.dial < -100) // 向上超过100,打开摩擦轮
         shoot_cmd_send.friction_mode = FRICTION_ON;
     else
         shoot_cmd_send.friction_mode = FRICTION_OFF;
-    // 拨弹控制,遥控器固定为一种拨弹模式,可自行选择
-    if (rc_data[TEMP].rc.dial < -500)
+    // 拨弹控制,拨轮向下拨(dial>100)开始连发,速度环(连发). 向上拨时不拨弹
+    if (rc_data[TEMP].rc.dial > 100)
         shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
     else
         shoot_cmd_send.load_mode = LOAD_STOP;
@@ -325,9 +327,10 @@ static void EmergencyHandler()
     }
     rc_was_online = 1;
 
-    // 右侧开关拨到[上]为主动急停,失能所有电机;拨轮向下拨超过一半(dial>300)同样进入急停
+    // 右侧开关拨到[上]为主动急停,失能所有电机
     // 注意:不再用robot_state==ROBOT_STOP作为急停条件,否则一旦进入急停将无法恢复
-    if (switch_is_up(rc_data[TEMP].rc.switch_right) || rc_data[TEMP].rc.dial > 300)
+    // 拨轮已移出急停(向下拨用于拨弹),急停只保留: 右开关拨上 + 遥控器离线daemon(见上方rc_online判断)
+    if (switch_is_up(rc_data[TEMP].rc.switch_right))
     {
         robot_state = ROBOT_STOP;
         gimbal_cmd_send.gimbal_mode = GIMBAL_ZERO_FORCE;
@@ -335,10 +338,7 @@ static void EmergencyHandler()
         shoot_cmd_send.shoot_mode = SHOOT_OFF;
         shoot_cmd_send.friction_mode = FRICTION_OFF;
         shoot_cmd_send.load_mode = LOAD_STOP;
-        // 只有遥控器连接且右拨杆在上时,不报emergency stop(主动急停,非异常)
-        // 拨轮打满(dial>300)触发的急停仍报错
-        if (!switch_is_up(rc_data[TEMP].rc.switch_right))
-            LOGERROR("[CMD] emergency stop!");
+        // 主动急停(右拨杆在上),非异常,不报emergency stop
         return; // 急停时不进行恢复判断
     }
 
@@ -367,6 +367,10 @@ void RobotCMDTask()
 
     // 根据gimbal的反馈值计算云台和底盘正方向的夹角,不需要传参,通过static私有变量完成
     CalcOffsetAngle();
+    // 发射默认使能: 放在模式分支之前, 保证上电及任何左开关位置下 shoot_mode=SHOOT_ON.
+    // 后续 EmergencyHandler() 在急停(右开关上)/遥控器离线时会覆盖为 SHOOT_OFF, 安全优先级不变.
+    // 解决原问题: shoot_mode 仅在 RemoteControlSet(左开关下)内被置ON, 导致左开关在中位/上电时保持SHOOT_OFF, 拨盘被锁死.
+    shoot_cmd_send.shoot_mode = SHOOT_ON;
     // 根据遥控器左侧开关,确定当前使用的控制模式为遥控器调试还是键鼠
     if (switch_is_down(rc_data[TEMP].rc.switch_left)) // 遥控器左侧开关状态为[下],遥控器控制
         RemoteControlSet();

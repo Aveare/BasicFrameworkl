@@ -16,3 +16,6 @@
 
 
 左右摩擦轮都是RoboMaster Snail 2305+c615电调，走PWM（TIM1 CH2/PE11、TIM1 CH3/PE13），不走CAN。早期版本里的两个M3508 CAN摩擦轮实例已停用并注释清理。
+左摩擦轮->TIM1_CH1
+右摩擦轮->TIM1_CH2
+舵机->TIM1_CH3//预分配，未插PWM3路线

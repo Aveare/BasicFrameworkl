@@ -32,7 +32,7 @@ void RobotInit()
 #if defined(ONE_BOARD) || defined(GIMBAL_BOARD)
     RobotCMDInit();
     GimbalInit();
-    // ShootInit();
+    ShootInit(); // 摩擦轮PWM(TIM1_CH2/CH3)+弹舱舵机(TIM1_CH1)+拨盘m2006, 取消注释以注册PWM并启动发射任务
 #endif
 
 #if defined(ONE_BOARD) || defined(CHASSIS_BOARD)
@@ -50,7 +50,7 @@ void RobotTask()
 #if defined(ONE_BOARD) || defined(GIMBAL_BOARD)
     RobotCMDTask();
     GimbalTask();
-    // ShootTask();
+    ShootTask(); // 处理shoot_cmd话题, 根据friction_mode/lid_mode设PWM占空比
 #endif
 
 #if defined(ONE_BOARD) || defined(CHASSIS_BOARD)
