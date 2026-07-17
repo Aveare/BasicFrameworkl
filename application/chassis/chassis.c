@@ -22,6 +22,7 @@
 #include "bsp_dwt.h"
 #include "referee_UI.h"
 #include "arm_math.h"
+#include "user_lib.h"
 #include "usart.h" // huart1, 用于 VOFA+ 波形打印 (USART1 PA9/PB7 921600, 当前空闲)
 #include "remote_control.h" // RemoteControlGetData(), 读取右摇杆原始值用于VOFA+调试
 #include <stdio.h>
@@ -59,6 +60,11 @@ static DJIMotorInstance * motor_lf, *motor_rf, *motor_lb, *motor_rb; // left rig
 #define CHASSIS_SPEED_PID_MAX_OUT 15000.0f
 #define CHASSIS_SPEED_PID_INTEGRAL_LIMIT 3000.0f
 
+#define CHASSIS_FOLLOW_WZ_KP 1.5f
+#define CHASSIS_FOLLOW_WZ_DIR 1.0f
+#define CHASSIS_FOLLOW_WZ_MAX 1200.0f
+#define CHASSIS_FOLLOW_DEADBAND 1.0f
+
 /* 用于自旋变速策略的时间变量 */
 // static float t;
 
@@ -66,28 +72,36 @@ static DJIMotorInstance * motor_lf, *motor_rf, *motor_lb, *motor_rb; // left rig
 static float chassis_vx, chassis_vy;                      // 将云台系的速度投影到底盘
 static float vt_lf, vt_rf, vt_lb, vt_rb;                  // 底盘速度解算后的临时输出,待进行限幅
 
+static float ChassisFollowWz(float offset_angle)
+{
+    offset_angle = float_deadband(offset_angle, -CHASSIS_FOLLOW_DEADBAND, CHASSIS_FOLLOW_DEADBAND);
+    float offset_abs = offset_angle >= 0.0f ? offset_angle : -offset_angle;
+    float wz = CHASSIS_FOLLOW_WZ_DIR * CHASSIS_FOLLOW_WZ_KP * offset_angle * offset_abs;
+
+    return float_constrain(wz, -CHASSIS_FOLLOW_WZ_MAX, CHASSIS_FOLLOW_WZ_MAX);
+}
+
 /**
- * @brief 通过 USART1 以 VOFA+ FireWater 协议打印 云台偏角 与 4 个 3508 的目标/实际速度
- *        9 通道: offset_angle, LF_ref,LF_meas, RF_ref,RF_meas, LB_ref,LB_meas, RB_ref,RB_meas
- *        波形在 VOFA+ 中按本顺序出现: offset_angle, LF_ref,LF_meas, RF_ref,RF_meas, LB_ref,LB_meas, RB_ref,RB_meas
- *        用途: 同时观察offset_angle是否归零(云台对正应≈0)与四轮速度是否两两相等(正推:LF=LB,RF=RB,LF=-RF)
+ * @brief 通过 USART1 以 VOFA+ FireWater 协议打印 四个轮毂电机的目标转速
+ *        4 通道: LF_ref, RF_ref, LB_ref, RB_ref (°/s, speed_PID.Ref, 即 MecanumCalculate 解算输出)
+ *        波形在 VOFA+ 中按本顺序出现。用于核对横移/转向时四轮目标速度的符号模式:
+ *          前进应四轮同号; 横移应对角同号(LF==RB, RF==LB, 且 LF==-RF); 自转应前后异号。
  * @note  USART1 (PA9 TX / PB7 RX, 921600 8N1) 当前在 VISION_USE_VCP 下空闲;
  *        若切换为 VISION_USE_UART 视觉会占用 huart1, 本函数将与之冲突.
- *        阻塞发送, 单帧约 110 字节, 921600 下耗时约 1.1ms, 请确保调用频率 <= 1kHz.
+ *        阻塞发送, 单帧约 48 字节, 921600 下耗时约 0.5ms, 请确保调用频率 <= 1kHz.
  */
-__attribute__((unused)) static void VofaSendChassisPID()
+static void VofaSendChassisPID()
 {
     if (!motor_lf || !motor_rf || !motor_lb || !motor_rb)
         return; // 电机未初始化或离线时不打印, 避免空指针解引用
 
-    char buf[128];
+    char buf[96];
     int len = snprintf(buf, sizeof(buf),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
-        chassis_cmd_recv.offset_angle,
-        motor_lf->motor_controller.speed_PID.Ref, motor_lf->measure.speed_aps,
-        motor_rf->motor_controller.speed_PID.Ref, motor_rf->measure.speed_aps,
-        motor_lb->motor_controller.speed_PID.Ref, motor_lb->measure.speed_aps,
-        motor_rb->motor_controller.speed_PID.Ref, motor_rb->measure.speed_aps);
+        "%.2f,%.2f,%.2f,%.2f\n",
+        motor_lf->motor_controller.speed_PID.Ref,
+        motor_rf->motor_controller.speed_PID.Ref,
+        motor_lb->motor_controller.speed_PID.Ref,
+        motor_rb->motor_controller.speed_PID.Ref);
     if (len > 0)
         HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 50);
 }
@@ -119,20 +133,22 @@ void ChassisInit()
     };
     //  @todo: 当前还没有设置电机的正反转,仍然需要手动添加reference的正负号,需要电机module的支持,待修改.
     //使用功率控制的电机需要使用PowerControlInit()函数初始化,因为电机的控制方式不同
-    chassis_motor_config.can_init_config.tx_id = 1;
+    //设定四个电机的canid（原本想设置成LF->0x201,LB->0x202,RF->0x204,RB->0x203）
+    //但是装车的时候电调装反了。。。现在的canid是lf->0x204,rf->0x201,lb->0x202,RB->0x203
+    chassis_motor_config.can_init_config.tx_id = 4;
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     motor_lf = PowerControlInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 2;
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
+    chassis_motor_config.can_init_config.tx_id = 1;
+    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rf = PowerControlInit(&chassis_motor_config);
 
-    chassis_motor_config.can_init_config.tx_id = 4;
+    chassis_motor_config.can_init_config.tx_id = 2;
     chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
     motor_lb = PowerControlInit(&chassis_motor_config);
 
     chassis_motor_config.can_init_config.tx_id = 3;
-    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
+    chassis_motor_config.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_REVERSE;
     motor_rb = PowerControlInit(&chassis_motor_config);
 
     referee_data = UITaskInit(&huart6, &ui_data); // 裁判系统初始化,会同时初始化UI
@@ -187,10 +203,15 @@ void ChassisInit()
  */
 static void MecanumCalculate()
 {
-    vt_lf = -chassis_vx - chassis_vy - chassis_cmd_recv.wz * LF_CENTER;
-    vt_rf = -chassis_vx + chassis_vy - chassis_cmd_recv.wz * RF_CENTER;
-    vt_lb = chassis_vx - chassis_vy - chassis_cmd_recv.wz * LB_CENTER;
-    vt_rb = chassis_vx + chassis_vy - chassis_cmd_recv.wz * RB_CENTER;
+    // 麦克纳姆轮逆解算. 坐标系: vx前+, vy右+, wz逆时针+.
+    // 当前RF/RB设置为MOTOR_DIRECTION_REVERSE, 因此wz参考值采用左右异号, 保证纯自转时四轮实际同向转.
+    // 轮组排列: LF&RB 滚子沿"左前-右后"对角, RF&LB 沿"右前-左后"对角(标准X型).
+    // 前进 vx: 四轮同号; 横移 vy: 对角同号(LF&RB 与 RF&LB 各自同号, 两对相反);
+    // 自转 wz: 参考值左右异号(LF/LB 与 RF/RB 相反)
+    vt_lf =  chassis_vx + chassis_vy + chassis_cmd_recv.wz * LF_CENTER;
+    vt_rf =  chassis_vx - chassis_vy - chassis_cmd_recv.wz * RF_CENTER;
+    vt_lb =  chassis_vx - chassis_vy + chassis_cmd_recv.wz * LB_CENTER;
+    vt_rb =  chassis_vx + chassis_vy - chassis_cmd_recv.wz * RB_CENTER;
 }
 
 /**
@@ -258,7 +279,7 @@ void ChassisTask()
         chassis_cmd_recv.wz = 0;
         break;
     case CHASSIS_FOLLOW_GIMBAL_YAW: // 跟随云台,不单独设置pid,以误差角度平方为速度输出
-        chassis_cmd_recv.wz = -1.5f * chassis_cmd_recv.offset_angle * abs(chassis_cmd_recv.offset_angle);
+        chassis_cmd_recv.wz = ChassisFollowWz(chassis_cmd_recv.offset_angle);
         break;
     case CHASSIS_ROTATE: // 自旋,同时保持全向机动;当前wz维持定值,后续增加不规则的变速策略
         // 自旋控制暂时注释停用,后期再调试该功能
@@ -269,13 +290,23 @@ void ChassisTask()
         break;
     }
 
-    // 根据云台和底盘的角度offset将控制量映射到底盘坐标系上
+    // 将控制量映射到底盘坐标系. 仅跟随模式做场向旋转, 不跟随模式底盘坐标系固定, 直接用底盘相对量.
     // 底盘逆时针旋转为角度正方向;云台命令的方向以云台指向的方向为x,采用右手系(x指向正北时y在正东)
-    static float sin_theta, cos_theta;
-    cos_theta = arm_cos_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
-    sin_theta = arm_sin_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
-    chassis_vx = chassis_cmd_recv.vx * cos_theta - chassis_cmd_recv.vy * sin_theta;
-    chassis_vy = chassis_cmd_recv.vx * sin_theta + chassis_cmd_recv.vy * cos_theta;
+    // NO_FOLLOW: 底盘不自转, 摇杆=底盘前后/左右, 不随云台偏转混叠vx/vy(否则纯横移会掺入前后分量, 四轮不再两两相等).
+    // FOLLOW: 场向控制, 把云台系输入按offset旋转到底盘系, 保证"推杆方向=云台朝向方向".
+    if (chassis_cmd_recv.chassis_mode == CHASSIS_FOLLOW_GIMBAL_YAW)
+    {
+        static float sin_theta, cos_theta;
+        cos_theta = arm_cos_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
+        sin_theta = arm_sin_f32(chassis_cmd_recv.offset_angle * DEGREE_2_RAD);
+        chassis_vx = chassis_cmd_recv.vx * cos_theta + chassis_cmd_recv.vy * sin_theta;
+        chassis_vy = -chassis_cmd_recv.vx * sin_theta + chassis_cmd_recv.vy * cos_theta;
+    }
+    else
+    {
+        chassis_vx = chassis_cmd_recv.vx;
+        chassis_vy = chassis_cmd_recv.vy;
+    }
 
     // 根据控制模式进行正运动学解算,计算底盘输出
     MecanumCalculate();
@@ -301,5 +332,5 @@ void ChassisTask()
     CANCommSend(chasiss_can_comm, (void *)&chassis_feedback_data);
 #endif // CHASSIS_BOARD
 
-    // VofaSendChassisPID(); // 已停用底盘VOFA打印, 改为只打印发射(摩擦轮PWM+2006速度). 需要时取消注释即可
+    VofaSendChassisPID(); // VOFA+ 打印 四轮目标转速(LF,RF,LB,RB), 用于核对横移/转向符号模式 (USART1)
 }

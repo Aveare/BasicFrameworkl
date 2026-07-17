@@ -174,7 +174,7 @@ void ShootInit()
  *        若切换为 VISION_USE_UART 视觉会占用 huart1, 本函数将与之冲突.
  *        阻塞发送, 单帧约 60 字节, 921600 下耗时约 0.6ms, 请确保调用频率 <= 1kHz.
  */
-static void VofaSendShootDebug()
+__attribute__((unused)) static void VofaSendShootDebug()
 {
     if (!friction_l_pwm || !friction_r_pwm || !loader)
         return; // PWM或拨盘未初始化时不打印, 避免空指针解引用
@@ -313,5 +313,5 @@ void ShootTask()
     // 反馈数据,目前暂时没有要设定的反馈数据,后续可能增加应用离线监测以及卡弹反馈
     PubPushMessage(shoot_pub, (void *)&shoot_feedback_data);
 
-    VofaSendShootDebug(); // VOFA+ 打印 摩擦轮PWM脉宽(ms) + 2006目标/实际速度 (USART1)
+    // VofaSendShootDebug(); // 已停用发射VOFA打印, huart1 改由底盘打印四轮目标转速. 需要时取消注释即可
 }

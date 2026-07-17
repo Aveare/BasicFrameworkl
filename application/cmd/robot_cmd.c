@@ -9,6 +9,7 @@
 #include "general_def.h"
 #include "dji_motor.h"
 #include "bmi088.h"
+#include "user_lib.h"
 // bsp
 #include "bsp_dwt.h"
 #include "bsp_log.h"
@@ -16,6 +17,7 @@
 // 私有宏,自动将编码器转换成角度值
 #define YAW_ALIGN_ANGLE (YAW_CHASSIS_ALIGN_ECD * ECD_ANGLE_COEF_DJI) // 对齐时的角度,0-360
 #define PTICH_HORIZON_ANGLE (PITCH_HORIZON_ECD * ECD_ANGLE_COEF_DJI) // pitch水平时电机的角度,0-360
+#define YAW_OFFSET_DIR -1.0f // yaw编码器方向: 云台物理右偏应为负偏角, 物理左偏应为正偏角
 
 /* cmd应用包含的模块实例指针和交互信息存储*/
 #ifdef GIMBAL_BOARD // 对双板的兼容,条件编译
@@ -130,21 +132,7 @@ static void CalcOffsetAngle()
     // 别名angle提高可读性,不然太长了不好看,虽然基本不会动这个函数
     static float angle;
     angle = gimbal_fetch_data.yaw_motor_single_round_angle; // 从云台获取的当前yaw电机单圈角度
-#if YAW_ECD_GREATER_THAN_4096                               // 如果大于180度
-    if (angle > YAW_ALIGN_ANGLE && angle <= 180.0f + YAW_ALIGN_ANGLE)
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
-    else if (angle > 180.0f + YAW_ALIGN_ANGLE)
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE - 360.0f;
-    else
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
-#else // 小于180度
-    if (angle > YAW_ALIGN_ANGLE)
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
-    else if (angle <= YAW_ALIGN_ANGLE && angle >= YAW_ALIGN_ANGLE - 180.0f)
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE;
-    else
-        chassis_cmd_send.offset_angle = angle - YAW_ALIGN_ANGLE + 360.0f;
-#endif
+    chassis_cmd_send.offset_angle = YAW_OFFSET_DIR * theta_format(angle - YAW_ALIGN_ANGLE);
 }
 
 /**
@@ -154,13 +142,13 @@ static void CalcOffsetAngle()
 static void RemoteControlSet()
 {
     // 控制底盘和云台运行模式,云台待添加,云台是否始终使用IMU数据?
-    // 右侧开关[下]原为底盘跟随云台(CHASSIS_ROTATE自旋),暂时注释停用,后期再调试该功能
-    // if (switch_is_down(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[下],底盘跟随云台
-    // {
-    //     chassis_cmd_send.chassis_mode = CHASSIS_ROTATE;
-    //     gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
-    // }
-    if (switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],底盘和云台分离,底盘保持不转动
+    // 右侧开关[下]:底盘跟随云台 yaw(角度环叠加),云台用陀螺仪反馈保持绝对朝向.不使用 CHASSIS_ROTATE(小陀螺自转)
+    if (switch_is_down(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[下],底盘跟随云台
+    {
+        chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
+        gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
+    }
+    else if (switch_is_mid(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[中],底盘和云台分离,底盘保持不转动
     {
         chassis_cmd_send.chassis_mode = CHASSIS_NO_FOLLOW;
         gimbal_cmd_send.gimbal_mode = GIMBAL_FREE_MODE;
@@ -188,8 +176,10 @@ static void RemoteControlSet()
 
     // 底盘参数,目前没有加入小陀螺(调试似乎暂时没有必要)
     // 摇杆范围约±660, 系数 10.0f 使满杆对应电机端 6600 °/s (与 speed_PID.Measure 同量纲)
-    chassis_cmd_send.vx = 10.0f * (float)rc_data[TEMP].rc.rocker_r_; // _水平方向
-    chassis_cmd_send.vy = 10.0f * (float)rc_data[TEMP].rc.rocker_r1; // 1数值方向
+    // 参考系: 正前方 → vx, 正右方 → vy
+    // 右摇杆: 竖直(rocker_r1)→vx(前进), 水平(rocker_r_)→vy(右移)
+    chassis_cmd_send.vx = 10.0f * (float)rc_data[TEMP].rc.rocker_r1;   // 右竖直 → vx (前进)
+    chassis_cmd_send.vy = 10.0f * (float)rc_data[TEMP].rc.rocker_r_;   // 右水平 → vy (右移)
 
     // 发射参数
     if (switch_is_up(rc_data[TEMP].rc.switch_right)) // 右侧开关状态[上],弹舱打开
